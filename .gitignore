@@ -1,0 +1,11 @@
+# Monorepo root. framework/ and connector/ keep their own .gitignore (anchored to their dirs).
+.venv/
+__pycache__/
+.env
+.env.*
+!.env.example
+/scratch/
+# per-checkout pin of the framework dir for scripts/framework_dir.sh
+.fsr_src
+# lab-specific deny patterns for scripts/check_infra_leaks.py: local only, never tracked
+scripts/infra_patterns.local.json

@@ -1,0 +1,62 @@
+name: Release (publish fsr-playbooks to PyPI)
+
+# Builds the fsr_playbooks wheel and publishes it to PyPI via Trusted
+# Publishing (OIDC) -- no API token stored in the repo. PyPI verifies the
+# workflow identity directly.
+#
+# ONE-TIME PyPI SETUP (required before the first run):
+#   PyPI -> your account -> Publishing -> "Add a pending publisher"
+#     PyPI Project Name:  fsr_playbooks
+#     Owner:              ftnt-dspille
+#     Repository name:    <the monorepo's name>
+#     Workflow name:      release.yml
+#     Environment name:   pypi
+#
+# To release: `make release VERSION=X.Y.Z` (tags `vX.Y.Z`, publishes a GitHub Release on it).
+# Connector tags are `connector-vX.Y.Z` and never trigger this workflow's version. The
+# version is derived from that tag by hatch-vcs -- there is NO version string to
+# bump in any file (see packaging/fsr_playbooks/pyproject.toml + RELEASING.md).
+# `git tag vX.Y.Z && git push origin vX.Y.Z`, then cut the Release. PyPI rejects
+# re-uploading an existing version, so each release needs a fresh, higher tag.
+#
+# `workflow_dispatch` off a branch with no tag at HEAD builds a dev version
+# (e.g. 0.4.11.devN) -- useful for a dry run, but don't publish those to PyPI.
+
+on:
+  release:
+    types: [published]  # only vX.Y.Z releases build a wheel; see the guard below
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build + publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for Trusted Publishing (OIDC)
+    # connector-v* releases (if ever created) must not publish a wheel
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # hatch-vcs derives the version from the git tag, so the full history
+          # (and the tags) must be fetched -- the default depth-1 clone has none.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build wheel
+        # Wheel only -- the external ../../fsr_playbooks source (grafted via
+        # force-include) makes a valid in-place wheel but cannot produce a
+        # correct sdist.
+        run: cd framework/packaging/fsr_playbooks && uv build --wheel --out-dir dist
+
+      - name: Validate metadata
+        run: uvx twine check framework/packaging/fsr_playbooks/dist/*.whl
+
+      - name: Release (publish fsr-playbooks to PyPI)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: framework/packaging/fsr_playbooks/dist

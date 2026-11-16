@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: what changed
+    runs-on: ubuntu-latest
+    outputs:
+      framework: ${{ steps.f.outputs.framework }}
+      connector: ${{ steps.f.outputs.connector }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: f
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            framework:
+              - 'framework/**'
+              - '.github/workflows/**'
+              - 'scripts/**'
+            connector:
+              # the connector is tested against the framework in the SAME commit,
+              # so a framework change runs the connector suite too
+              - 'connector/**'
+              - 'framework/**'
+              - '.github/workflows/**'
+              - 'scripts/**'
+
+  hygiene:
+    name: infra-leak guard (whole tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # No lab overlay on a public clone: only the generic vendor-host rules apply,
+      # and the guard says so. The overlay runs locally and in the owner's pre-commit.
+      - run: python3 scripts/check_infra_leaks.py --all
+
+  framework-lint:
+    name: framework ruff
+    needs: changes
+    if: needs.changes.outputs.framework == 'true'
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: framework } }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      # Pinned to match .pre-commit-config.yaml so local + CI agree. tooling/ and
+      # conftest.py are linted too: three gates that lint different things are
+      # three chances for one of them to be the only thing standing between a
+      # violation and main.
+      - run: scripts/ci_suite.sh lint
+
+  framework-test:
+    name: framework pytest (py${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.framework == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    defaults: { run: { working-directory: framework } }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # hatch-vcs derives the version from the git tag: tags must be here.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+      - name: Install deps
+        # See the comments this replaced in the pre-monorepo ci.yml: the editable
+        # install of the package is load-bearing (version is read from installed
+        # metadata), and python-dotenv is for the tooling suite only.
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install pyyaml "ruamel.yaml" jinja2 openai anthropic "mcp>=1.0" \
+                         httpx pytest requests-mock anyio python-dotenv
+          uv pip install mypy==2.1.0
+          uv pip install --no-deps -e packaging/fsr_playbooks
+      - name: Run tests
+        env: { PY: .venv/bin/python }
+        run: scripts/ci_suite.sh tests-pkg
+      - name: Run tooling tests
+        # Own process: the two suites resolve different reference DBs.
+        env: { PY: .venv/bin/python }
+        run: scripts/ci_suite.sh tests-tooling
+      - name: Type check + mypy ratchet
+        env: { PY: .venv/bin/python }
+        run: scripts/ci_suite.sh types
+
+  connector-test:
+    name: connector pytest (py3.12, framework from this commit)
+    needs: changes
+    if: needs.changes.outputs.connector == 'true'
+    runs-on: ubuntu-latest
+    env:
+      FSRPB_DEV: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: System tools the suite shells out to
+        # git: test_doctor builds scratch repos; make: test_box drives the Makefile;
+        # rsync: test_prune_remote_py.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends git make rsync
+      - name: Install (connector deps + framework editable from ./framework)
+        # Mirrors connector/scripts/dev_env.sh without the sibling-pyfsr uv source:
+        # the connector's own requirements (minus the fsr-playbooks pin, which the
+        # checkout replaces), then the in-repo framework. tests/test_framework_dir.py
+        # and the resolver make FSR_SRC/FSRPB_FRAMEWORK_DIR unnecessary.
+        run: |
+          uv venv --python 3.12
+          grep -hv '^fsr-playbooks==' connector/connector-fsr-agentic-assistant/requirements.txt > /tmp/conn-req.txt
+          uv pip install -r /tmp/conn-req.txt -e "connector[test]" \
+                         "pytest>=7" "pytest-randomly>=3" "pytest-timeout>=2" "ruff==0.15.20"
+          uv pip uninstall fsr-playbooks || true
+          uv pip install --no-deps -e framework/packaging/fsr_playbooks
+          uv pip install pyyaml "ruamel.yaml" jinja2 openai anthropic "mcp>=1.0" httpx requests-mock anyio python-dotenv
+      - name: pin preflight (connector imports resolve in the PINNED wheel)
+        # A connector commit that needs an unreleased framework symbol is red here,
+        # at PR time, not at ship. Tests above use the in-repo framework.
+        run: .venv/bin/python connector/scripts/preflight_framework.py
+        continue-on-error: false
+      - name: Connector suite
+        # Bare pytest from connector/: an explicit path would override testpaths in
+        # pyproject.toml, which decides that BOTH the outer and the package suites run.
+        working-directory: connector
+        env:
+          FSRPB_FRAMEWORK_DIR: ${{ github.workspace }}/framework
+          PYTHONPATH: ${{ github.workspace }}/framework/tooling
+        run: ../.venv/bin/python -m pytest -q --no-header
+
+  package:
+    name: build wheel + twine check
+    needs: changes
+    if: needs.changes.outputs.framework == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v7
+      - name: Build wheel
+        # root = ../../.. (monorepo root) and --match 'v[0-9]*' keep connector tags
+        # out of the version.
+        run: cd framework/packaging/fsr_playbooks && uv build --wheel --out-dir dist
+      - name: Validate metadata
+        run: uvx twine check framework/packaging/fsr_playbooks/dist/*.whl
+      - name: Version matches git describe
+        run: |
+          v="$(ls framework/packaging/fsr_playbooks/dist/*.whl | sed -E 's#.*/fsr_playbooks-([^-]+)-.*#\1#')"
+          d="$(git describe --tags --long --match 'v[0-9]*')"
+          echo "wheel=$v describe=$d"
+          case "$d" in v"${v%%+*}"*|v"${v%%.post*}"*|v"${v%%.dev*}"*) ;; *) echo "version drift"; exit 1;; esac
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fsr_playbooks-wheel
+          path: framework/packaging/fsr_playbooks/dist/*.whl
